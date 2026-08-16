@@ -166,18 +166,53 @@ def stage_tracker(cfg, rows, ocr_note):
                          ocr_note=ocr_note, consolidated_dir=cfg.paths.consolidated_dir())
 
 
+def _configure_ocr_for_run(cfg, log):
+    """v1.4 fix (2026-08-16): single source of truth for OCR readiness.
+
+    Previously this function ALWAYS called ocr_support.configure_ocr()
+    independently, even when the caller (app_gui.py, via
+    runtime_paths.apply_to_config()) had ALREADY successfully found and set
+    cfg.ingestion.tesseract_cmd/poppler_path. Since ocr_support.py and
+    runtime_paths.py are two separate detection implementations that can
+    disagree (confirmed: a user's real run showed 10 successful OCR reads
+    -- proving runtime_paths' detection worked -- while the summary
+    simultaneously reported "OCR unavailable" from ocr_support's own,
+    separately-failed detection), this produced a contradictory, confusing
+    status message even though OCR was actually working correctly.
+
+    Fix: if the caller already supplied a working tesseract_cmd (and,
+    ideally, poppler_path), TRUST it directly and skip calling
+    ocr_support.configure_ocr() entirely - there is nothing to
+    re-detect, and no way for the two mechanisms to disagree if only one
+    of them ever runs. ocr_support.configure_ocr() is now only used as a
+    fallback for callers that have NOT already resolved OCR paths
+    themselves (e.g. the CLI entry point via main(), which never calls
+    runtime_paths.py).
+    """
+    if cfg.ingestion.tesseract_cmd:
+        note = f"OCR ready (pre-configured) — tesseract: {cfg.ingestion.tesseract_cmd}"
+        if not cfg.ingestion.poppler_path:
+            note += " [poppler_path not set - relying on PATH]"
+        log(f"[OCR] {note}")
+        return note
+
+    status = ocr_support.configure_ocr()
+    note = status.summary()
+    log(f"[OCR] {note}")
+    if status.ready:
+        cfg.ingestion.tesseract_cmd = status.tesseract_path
+        cfg.ingestion.poppler_path = status.poppler_path
+    else:
+        log("[OCR] Scanned files will be flagged for review instead of read.")
+    return note
+
+
 def run(cfg, copy_files=True, log=print, progress=None):
     t0 = time.time()
-    ocr_note = "disabled"
     if cfg.ingestion.enable_ocr:
-        status = ocr_support.configure_ocr(); ocr_note = status.summary()
-        log(f"[OCR] {ocr_note}")
-        if status.ready:
-            cfg.ingestion.tesseract_cmd = cfg.ingestion.tesseract_cmd or status.tesseract_path
-            cfg.ingestion.poppler_path = cfg.ingestion.poppler_path or status.poppler_path
-        if not status.ready:
-            log("[OCR] Scanned files will be flagged for review instead of read.")
+        ocr_note = _configure_ocr_for_run(cfg, log)
     else:
+        ocr_note = "disabled"
         log("[OCR] Disabled by user — scanned files flagged for review.")
 
     src = cfg.paths.source_dir
