@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+vendor/
+tests/test_pdfs/
+tests/large_test_pdfs/
+*.cache.jsonl
+migration_tracker.xlsx
+.vscode/
+.idea/
