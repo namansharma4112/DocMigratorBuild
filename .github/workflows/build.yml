@@ -59,7 +59,8 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller legal_migration.spec --noconfirm --clean
+          pip install pyinstaller
+          python -m PyInstaller legal_migration.spec --noconfirm --clean
 
       - name: Verify the EXE was produced
         shell: pwsh
