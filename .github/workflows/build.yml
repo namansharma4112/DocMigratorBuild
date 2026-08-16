@@ -1,0 +1,91 @@
+name: Build Windows EXE (with OCR bundled)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Install Tesseract-OCR (via Chocolatey)
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $tessDir = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path "$tessDir\tesseract.exe")) {
+            throw "Tesseract install did not produce tesseract.exe at $tessDir"
+          }
+          New-Item -ItemType Directory -Force -Path "vendor\tesseract" | Out-Null
+          Copy-Item -Path "$tessDir\*" -Destination "vendor\tesseract" -Recurse -Force
+
+      - name: Download & arrange Poppler for Windows
+        shell: pwsh
+        run: |
+          $popplerUrl = "https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip"
+          $zipPath = "$env:RUNNER_TEMP\poppler.zip"
+          Invoke-WebRequest -Uri $popplerUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\poppler_extract" -Force
+          $extractedRoot = Get-ChildItem "$env:RUNNER_TEMP\poppler_extract" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "vendor\poppler" | Out-Null
+          Copy-Item -Path "$($extractedRoot.FullName)\*" -Destination "vendor\poppler" -Recurse -Force
+          if (-not (Test-Path "vendor\poppler\Library\bin\pdftoppm.exe")) {
+            throw "Poppler bundle missing pdftoppm.exe after extraction"
+          }
+
+      - name: Run the automated test suite
+        shell: pwsh
+        run: |
+          python -m pytest tests -v
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller legal_migration.spec --noconfirm --clean
+
+      - name: Verify the EXE was produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\LegalDocMigration\LegalDocMigration.exe")) {
+            throw "Build did not produce the expected .exe"
+          }
+          Get-Item "dist\LegalDocMigration\LegalDocMigration.exe" | Format-List Name, Length
+
+      - name: Package the build output
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\LegalDocMigration\*" -DestinationPath "LegalDocMigration-Windows.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LegalDocMigration-Windows
+          path: LegalDocMigration-Windows.zip
+          retention-days: 30
+
+      - name: Create GitHub Release (only when a version tag is pushed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LegalDocMigration-Windows.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
