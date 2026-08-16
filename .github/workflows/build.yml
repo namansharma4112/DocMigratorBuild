@@ -55,7 +55,7 @@ jobs:
       - name: Run the automated test suite
         shell: pwsh
         run: |
-          python -m pytest tests -v
+          python -m pytest tests -v --timeout=120
 
       - name: Build with PyInstaller
         run: |
