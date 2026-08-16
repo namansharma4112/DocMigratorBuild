@@ -1,4 +1,13 @@
-"""ocr_support.py — OCR configuration and text-extraction helpers."""
+"""ocr_support.py — OCR engine detection/configuration.
+
+v1.3 fix (2026-08-16): search paths harmonised with runtime_paths.py
+(both now check vendor/poppler/bin AND vendor/poppler/Library/bin), since
+a mismatch between the two independent detection mechanisms was the root
+cause of a misleading "OCR unavailable" status message being shown even
+when OCR was actually working (see pipeline.py's run() for the accompanying
+fix that also stops this module from being called at all when the caller
+has already supplied working tesseract_cmd/poppler_path values directly).
+"""
 from __future__ import annotations
 
 import os
@@ -43,12 +52,11 @@ def _candidate_dirs(*subfolders: str) -> List[Path]:
 
 
 def _find_executable(name: str, bundled_subfolders: List[str]) -> Optional[str]:
-    exe_name = name
     for folder in _candidate_dirs(*bundled_subfolders):
-        candidate = folder / exe_name
+        candidate = folder / name
         if candidate.exists():
             return str(candidate)
-        bin_candidate = folder / "bin" / exe_name
+        bin_candidate = folder / "bin" / name
         if bin_candidate.exists():
             return str(bin_candidate)
     found = shutil.which(name)
@@ -64,7 +72,12 @@ def configure_ocr() -> OCRStatus:
     tesseract_path = _find_executable(tesseract_exe, ["tesseract", "Tesseract-OCR"])
 
     poppler_exe = "pdftoppm.exe" if os.name == "nt" else "pdftoppm"
-    poppler_exec_path = _find_executable(poppler_exe, ["poppler", "poppler/bin", "poppler-bin"])
+    # v1.3 fix: added "poppler/Library/bin" - matches runtime_paths.py and
+    # matches the actual folder layout produced by the oschwartz10612
+    # poppler-windows release used in build.yml (conda-forge style:
+    # Library/bin/pdftoppm.exe, not a plain bin/pdftoppm.exe).
+    poppler_exec_path = _find_executable(poppler_exe, ["poppler", "poppler/bin",
+                                                        "poppler/Library/bin", "poppler-bin"])
     poppler_bin_dir = str(Path(poppler_exec_path).parent) if poppler_exec_path else None
 
     if not tesseract_path:
@@ -73,7 +86,6 @@ def configure_ocr() -> OCRStatus:
         messages.append("poppler (pdftoppm) not found (checked bundled folders and PATH)")
 
     engine_version = None
-
     if tesseract_path:
         try:
             import pytesseract
@@ -112,37 +124,3 @@ def is_ocr_ready() -> bool:
     if _LAST_STATUS is None:
         _LAST_STATUS = configure_ocr()
     return _LAST_STATUS.ready
-
-
-def ocr_pdf_to_text(pdf_path, dpi: int = 300, lang: str = "eng") -> str:
-    global _LAST_STATUS
-    if _LAST_STATUS is None or not _LAST_STATUS.ready:
-        _LAST_STATUS = configure_ocr()
-    if not _LAST_STATUS.ready:
-        raise RuntimeError(f"OCR is not available: {_LAST_STATUS.summary()}")
-
-    import pytesseract
-    from pdf2image import convert_from_path
-
-    images = convert_from_path(
-        str(pdf_path),
-        dpi=dpi,
-        poppler_path=_POPPLER_BIN_DIR,
-    )
-
-    text_chunks = []
-    for page_image in images:
-        text_chunks.append(pytesseract.image_to_string(page_image, lang=lang))
-
-    return "\n\n".join(text_chunks)
-
-
-def ocr_image_to_text(image, lang: str = "eng") -> str:
-    global _LAST_STATUS
-    if _LAST_STATUS is None or not _LAST_STATUS.ready:
-        _LAST_STATUS = configure_ocr()
-    if not _LAST_STATUS.ready:
-        raise RuntimeError(f"OCR is not available: {_LAST_STATUS.summary()}")
-
-    import pytesseract
-    return pytesseract.image_to_string(image, lang=lang)
