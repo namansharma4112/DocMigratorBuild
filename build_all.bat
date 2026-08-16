@@ -27,7 +27,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/5] Running automated tests (stops the build if anything is broken)...
-python -m pytest tests -v
+python -m pytest tests -v --timeout=120
 if errorlevel 1 (
     echo ERROR: Tests failed - build stopped so a broken app is never produced.
     pause
