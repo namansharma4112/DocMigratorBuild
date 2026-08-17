@@ -2,7 +2,9 @@
 from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Callable, List, Optional
+
 
 try:
     import numpy as np
@@ -12,7 +14,11 @@ try:
 except Exception:
     _HAS_SKLEARN = False
 
+
 ProgressFn = Optional[Callable[[int, int], None]]
+LogFn = Optional[Callable[[str], None]]
+
+_LARGE_BUCKET_WARNING_THRESHOLD = 3000
 
 
 @dataclass
@@ -69,22 +75,52 @@ def _mark_exact(records: List[DedupRecord], key_fn, method: str, group_id_start:
     return gid
 
 
-def _entity_compatible(a: DedupRecord, b: DedupRecord) -> bool:
+def _involves_ocr(a: DedupRecord, b: DedupRecord) -> bool:
+    return a.extraction_method == "ocr" or b.extraction_method == "ocr"
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
+
+
+def _entity_compatible(a: DedupRecord, b: DedupRecord, cfg) -> bool:
     ea, eb = (a.entity_name or "").strip().lower(), (b.entity_name or "").strip().lower()
     if not ea or not eb:
         return True
-    return ea == eb
+    if ea == eb:
+        return True
+    if _involves_ocr(a, b):
+        return _fuzzy_ratio(ea, eb) >= cfg.entity_fuzzy_threshold
+    return False
 
 
 def _date_compatible(a: DedupRecord, b: DedupRecord) -> bool:
+    if a.extraction_method == "ocr" or b.extraction_method == "ocr":
+        return True
     da, db = (a.contract_date or "").strip(), (b.contract_date or "").strip()
     if not da or not db:
         return True
     return da == db
 
 
+def _similarity_threshold_for(a: DedupRecord, b: DedupRecord, cfg) -> float:
+    return cfg.near_dup_similarity_ocr if _involves_ocr(a, b) else cfg.near_dup_similarity
+
+
+def _build_similarity_matrix(texts: List[str]):
+    if not _HAS_SKLEARN:
+        return None
+    try:
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
+        matrix = vec.fit_transform(texts)
+        return cosine_similarity(matrix)
+    except Exception:
+        return None
+
+
 def _mark_near_duplicates(records: List[DedupRecord], cfg, group_id_start: int,
-                           progress: ProgressFn = None) -> int:
+                           progress: ProgressFn = None, log: LogFn = None) -> int:
+    log = log or (lambda *_: None)
     candidates = [r for r in records
                   if r.status == "retained" and len(r.text_norm or "") >= cfg.min_chars_for_similarity]
     if len(candidates) < 2:
@@ -98,31 +134,28 @@ def _mark_near_duplicates(records: List[DedupRecord], cfg, group_id_start: int,
         buckets = defaultdict(list)
         for r in candidates:
             buckets[r.doc_type].append(r)
-        bucket_list = list(buckets.values())
+        bucket_list = list(buckets.items())
     else:
-        bucket_list = [candidates]
+        bucket_list = [("(all)", candidates)]
 
     total = len(candidates)
     done = 0
 
-    for bucket in bucket_list:
+    for bucket_name, bucket in bucket_list:
         if len(bucket) < 2:
             done += len(bucket)
             if progress:
                 progress(done, total)
             continue
+
+        if len(bucket) > _LARGE_BUCKET_WARNING_THRESHOLD:
+            log(f"[DEDUPE] Large batch in '{bucket_name}' ({len(bucket)} documents) - "
+                f"near-duplicate comparison for this group may take noticeably longer.")
+
         bucket.sort(key=lambda r: r.idx)
         pos_of = {id(r): i for i, r in enumerate(bucket)}
 
-        if _HAS_SKLEARN:
-            try:
-                vec = TfidfVectorizer(min_df=1)
-                matrix = vec.fit_transform([r.text_norm for r in bucket])
-                sim_matrix = cosine_similarity(matrix)
-            except Exception:
-                sim_matrix = None
-        else:
-            sim_matrix = None
+        sim_matrix = _build_similarity_matrix([r.text_norm for r in bucket])
 
         anchor_positions: List[int] = []
         anchors: List[DedupRecord] = []
@@ -148,12 +181,17 @@ def _mark_near_duplicates(records: List[DedupRecord], cfg, group_id_start: int,
                         if sim > best_sim:
                             best_sim, best_anchor = sim, anchor
 
-            if (best_anchor is not None and best_sim >= cfg.near_dup_similarity
-                    and (not cfg.require_entity_match or _entity_compatible(rec, best_anchor))
-                    and (not cfg.require_date_compatible or _date_compatible(rec, best_anchor))):
-                gid += 1
-                group_id = best_anchor.dup_group_id or gid
-                _mark(rec, best_anchor, group_id, "near_dup_tfidf", best_sim)
+            if best_anchor is not None:
+                threshold = _similarity_threshold_for(rec, best_anchor, cfg)
+                if (best_sim >= threshold
+                        and (not cfg.require_entity_match or _entity_compatible(rec, best_anchor, cfg))
+                        and (not cfg.require_date_compatible or _date_compatible(rec, best_anchor))):
+                    gid += 1
+                    group_id = best_anchor.dup_group_id or gid
+                    _mark(rec, best_anchor, group_id, "near_dup_tfidf", best_sim)
+                else:
+                    anchors.append(rec)
+                    anchor_positions.append(pos_of[id(rec)])
             else:
                 anchors.append(rec)
                 anchor_positions.append(pos_of[id(rec)])
@@ -167,9 +205,10 @@ def _mark_near_duplicates(records: List[DedupRecord], cfg, group_id_start: int,
     return gid
 
 
-def deduplicate(records: List[DedupRecord], cfg, progress: ProgressFn = None) -> List[DedupRecord]:
+def deduplicate(records: List[DedupRecord], cfg, progress: ProgressFn = None,
+                 log: LogFn = None) -> List[DedupRecord]:
     gid = 0
     gid = _mark_exact(records, lambda r: r.file_sha256, "exact_file", gid)
     gid = _mark_exact(records, lambda r: r.text_sha256 if r.text_len > 0 else "", "exact_text", gid)
-    _mark_near_duplicates(records, cfg, gid, progress=progress)
+    _mark_near_duplicates(records, cfg, gid, progress=progress, log=log)
     return records
