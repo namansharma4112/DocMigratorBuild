@@ -1,13 +1,4 @@
-"""ocr_support.py — OCR engine detection/configuration.
-
-v1.3 fix (2026-08-16): search paths harmonised with runtime_paths.py
-(both now check vendor/poppler/bin AND vendor/poppler/Library/bin), since
-a mismatch between the two independent detection mechanisms was the root
-cause of a misleading "OCR unavailable" status message being shown even
-when OCR was actually working (see pipeline.py's run() for the accompanying
-fix that also stops this module from being called at all when the caller
-has already supplied working tesseract_cmd/poppler_path values directly).
-"""
+"""ocr_support.py — OCR engine detection/configuration."""
 from __future__ import annotations
 
 import os
@@ -72,10 +63,6 @@ def configure_ocr() -> OCRStatus:
     tesseract_path = _find_executable(tesseract_exe, ["tesseract", "Tesseract-OCR"])
 
     poppler_exe = "pdftoppm.exe" if os.name == "nt" else "pdftoppm"
-    # v1.3 fix: added "poppler/Library/bin" - matches runtime_paths.py and
-    # matches the actual folder layout produced by the oschwartz10612
-    # poppler-windows release used in build.yml (conda-forge style:
-    # Library/bin/pdftoppm.exe, not a plain bin/pdftoppm.exe).
     poppler_exec_path = _find_executable(poppler_exe, ["poppler", "poppler/bin",
                                                         "poppler/Library/bin", "poppler-bin"])
     poppler_bin_dir = str(Path(poppler_exec_path).parent) if poppler_exec_path else None
