@@ -3,7 +3,7 @@ import datetime as _dt
 import os as _os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 
 def desktop_output_dir(prefix: str = "LegalDocMigration") -> Path:
@@ -24,7 +24,7 @@ class Paths:
     source_dir: Path = Path("./input_pdfs")
     output_dir: Path = Path("./output")
     organised_dirname: str = "01_classified"
-    consolidated_dirname: str = "Consolidated"   # flat folder of ALL retained files
+    consolidated_dirname: str = "Consolidated"
     tracker_name: str = "migration_tracker.xlsx"
     text_cache_name: str = "extracted_text.cache.jsonl"
 
@@ -44,8 +44,8 @@ class Paths:
 @dataclass
 class Ingestion:
     min_native_chars: int = 120
-    ocr_max_pages: int = 3
-    ocr_dpi: int = 200
+    ocr_max_pages: Optional[int] = None
+    ocr_dpi: int = 300
     ocr_lang: str = "eng"
     enable_ocr: bool = True
     tesseract_cmd: Optional[str] = None
@@ -53,23 +53,158 @@ class Ingestion:
 
 
 CLASSIFICATION_KEYWORDS: Dict[str, List[str]] = {
+    "GST Certificate": ["gst certificate", "gstin", "goods and services tax certificate",
+                        "gst registration certificate", "certificate of registration",
+                        "form gst reg"],
+    "MSME Declaration": ["msme declaration", "udyam registration", "msme certificate",
+                         "micro small and medium enterprises", "udyog aadhaar",
+                         "msme registration certificate"],
+    "PAN Card": ["permanent account number", "pan card", "income tax pan",
+                 "pan no", "pan number", "income tax department"],
+    "Invoice": ["invoice", "tax invoice", "invoice no", "invoice number",
+                "proforma invoice", "commercial invoice", "bill of supply",
+                "e-invoice", "gst invoice", "invoice#", "bill no"],
+    "Cancelled Cheque": ["cancelled cheque", "cancelled check", "canceled cheque",
+                        "voided cheque", "cancelled cheque copy"],
+    "Challan": ["challan", "bank challan", "tax challan", "deposit challan",
+               "gst challan", "payment challan"],
+    "Payment Receipt": ["payment receipt", "receipt of payment", "cash receipt",
+                        "official receipt", "receipt", "money receipt",
+                        "payment voucher", "receipt no"],
     "Addendums": ["addendum", "amendment", "amendment agreement", "variation",
                   "change order", "supplemental agreement", "amendment no",
-                  "amended and restated", "deed of variation", "side letter"],
+                  "amended and restated", "deed of variation", "side letter",
+                  "amendment to agreement", "contract amendment"],
+    "NDA": ["non-disclosure agreement", "nda", "non disclosure agreement",
+            "mutual non-disclosure agreement", "mutual nda",
+            "confidentiality agreement", "receiving party", "disclosing party",
+            "confidential information disclosed", "confidentiality and non-disclosure agreement",
+            "cnda"],
     "Engagement Letters": ["engagement letter", "letter of engagement", "we are pleased to",
                            "scope of our services", "terms of engagement", "our engagement",
-                           "engagement of services", "this letter sets out", "fee arrangement",
+                           "engagement of services", "fee arrangement",
                            "audit engagement", "advisory engagement"],
+    "SOW": ["scope of work", "statement of work", "sow no", "sow number", "sow"],
+    "Extension Letter": ["extension letter", "letter of extension", "contract extension",
+                         "extend the term", "extension of contract", "renewal letter",
+                         "contract renewal"],
+    "Termination Letter": ["termination letter", "notice of termination", "letter of termination",
+                           "termination of agreement", "termination of contract",
+                           "notice to terminate", "contract termination notice"],
+    "PO": ["purchase order", "po number", "po no", "purchase order no",
+           "purchase order number", "po", "p.o.", "p.o", "po#"],
+    "Letter of Intent": ["letter of intent", "loi", "intent to engage", "intent to purchase"],
+    "Work Order": ["work order", "work order no", "work order number",
+                   "task order", "service order", "job order", "wo no", "work order#"],
+    "Order Form": ["order form", "sales order form"],
+    "MOU": ["memorandum of understanding", "mou", "memorandum of agreement", "moa"],
+    "Vendor Form": ["vendor form", "vendor details", "vendor registration", "vendor information",
+                    "vendor master", "supplier registration", "supplier details", "vendor onboarding",
+                    "new vendor creation form", "vendor master form", "supplier onboarding form"],
     "Contracts": ["master services agreement", "services agreement", "contract",
-                  "this agreement is made", "agreement between", "statement of work",
-                  "consulting agreement", "purchase agreement", "framework agreement",
-                  "terms and conditions", "in witness whereof", "hereinafter referred",
-                  "non-disclosure agreement", "nda", "memorandum of understanding"],
+                  "this agreement is made", "consulting agreement", "purchase agreement",
+                  "framework agreement"],
 }
-CLASSIFICATION_PRIORITY: List[str] = ["Addendums", "Engagement Letters", "Contracts"]
-FALLBACK_TYPE: str = "Other"
-TITLE_BOOST: float = 2.5
+
+CLASSIFICATION_PRIORITY: List[str] = [
+    "GST Certificate", "MSME Declaration", "PAN Card", "Invoice",
+    "Cancelled Cheque", "Challan", "Payment Receipt",
+    "Extension Letter", "Termination Letter", "PO", "Letter of Intent",
+    "Work Order", "Order Form", "MOU", "Vendor Form",
+    "Addendums", "NDA", "Engagement Letters", "SOW",
+    "Contracts",
+]
+
+HEADING_ONLY_KEYWORDS: Dict[str, Set[str]] = {
+    "GST Certificate": {"gst certificate", "gstin", "goods and services tax certificate",
+                        "gst registration certificate", "certificate of registration",
+                        "form gst reg"},
+    "MSME Declaration": {"msme declaration", "udyam registration", "msme certificate",
+                         "micro small and medium enterprises", "udyog aadhaar",
+                         "msme registration certificate"},
+    "PAN Card": {"permanent account number", "pan card", "income tax pan",
+                 "pan no", "pan number", "income tax department"},
+    "Invoice": {"invoice", "tax invoice", "invoice no", "invoice number",
+                "proforma invoice", "commercial invoice", "bill of supply",
+                "e-invoice", "gst invoice", "invoice#", "bill no"},
+    "Cancelled Cheque": {"cancelled cheque", "cancelled check", "canceled cheque",
+                        "voided cheque", "cancelled cheque copy"},
+    "Challan": {"challan", "bank challan", "tax challan", "deposit challan",
+               "gst challan", "payment challan"},
+    "Payment Receipt": {"payment receipt", "receipt of payment", "cash receipt",
+                        "official receipt", "receipt", "money receipt",
+                        "payment voucher", "receipt no"},
+    "Extension Letter": {"extension letter", "letter of extension", "contract extension",
+                         "extend the term", "extension of contract", "renewal letter",
+                         "contract renewal"},
+    "Termination Letter": {"termination letter", "notice of termination", "letter of termination",
+                           "termination of agreement", "termination of contract",
+                           "notice to terminate", "contract termination notice"},
+    "PO": {"purchase order", "po number", "po no", "purchase order no",
+           "purchase order number", "po", "p.o.", "p.o", "po#"},
+    "Letter of Intent": {"letter of intent", "loi", "intent to engage", "intent to purchase"},
+    "Work Order": {"work order", "work order no", "work order number",
+                   "task order", "service order", "job order", "wo no", "work order#"},
+    "Order Form": {"order form", "sales order form"},
+    "MOU": {"memorandum of understanding", "mou", "memorandum of agreement", "moa"},
+    "Vendor Form": {"vendor form", "vendor details", "vendor registration", "vendor information",
+                    "vendor master", "supplier registration", "supplier details", "vendor onboarding",
+                    "new vendor creation form", "vendor master form", "supplier onboarding form"},
+    "SOW": {"scope of work", "statement of work", "sow no", "sow number", "sow"},
+}
+
+CANONICAL_HEADING_PHRASES: Dict[str, List[str]] = {
+    "GST Certificate": ["gst certificate"],
+    "MSME Declaration": ["msme declaration", "udyam registration"],
+    "PAN Card": ["pan card", "permanent account number"],
+    "Invoice": ["invoice"],
+    "Cancelled Cheque": ["cancelled cheque"],
+    "Challan": ["challan"],
+    "Payment Receipt": ["receipt"],
+    "Extension Letter": ["extension letter"],
+    "Termination Letter": ["termination letter"],
+    "PO": ["purchase order"],
+    "Letter of Intent": ["letter of intent"],
+    "Work Order": ["work order"],
+    "Order Form": ["order form"],
+    "MOU": ["memorandum of understanding"],
+    "Vendor Form": ["vendor form", "vendor registration"],
+    "Addendums": ["addendum"],
+    "NDA": ["non-disclosure agreement"],
+    "Engagement Letters": ["engagement letter"],
+    "SOW": ["scope of work", "statement of work"],
+    "Contracts": ["services agreement"],
+}
+FUZZY_HEADING_THRESHOLD: float = 0.82
+MIN_FUZZY_PHRASE_LENGTH: int = 7
+
+CATCH_ALL_CATEGORY: str = "Contracts"
+FALLBACK_TYPE: str = "Unclassified"
+
+FOLDER_GROUP: Dict[str, str] = {
+    "Extension Letter": "Others", "Termination Letter": "Others", "PO": "Others",
+    "Letter of Intent": "Others", "Work Order": "Others", "Order Form": "Others",
+    "MOU": "Others", "Vendor Form": "Others",
+    "GST Certificate": "_DO_NOT_RETAIN", "MSME Declaration": "_DO_NOT_RETAIN",
+    "PAN Card": "_DO_NOT_RETAIN", "Invoice": "_DO_NOT_RETAIN",
+    "Cancelled Cheque": "_DO_NOT_RETAIN", "Challan": "_DO_NOT_RETAIN",
+    "Payment Receipt": "_DO_NOT_RETAIN",
+}
+
+DELETE_DOC_TYPES: Set[str] = {
+    "GST Certificate", "MSME Declaration", "PAN Card", "Invoice",
+    "Cancelled Cheque", "Challan", "Payment Receipt",
+}
+
+
+def folder_group_for(doc_type: str) -> str:
+    return FOLDER_GROUP.get(doc_type, doc_type)
+
+
+HEADING_ZONE_CHARS: int = 100
 TITLE_ZONE_CHARS: int = 1500
+TITLE_BOOST: float = 3.0
+MAX_HITS_PER_KEYWORD: int = 3
 
 
 @dataclass
@@ -81,10 +216,12 @@ class ClassificationThresholds:
 @dataclass
 class Dedup:
     near_dup_similarity: float = 0.90
-    min_chars_for_similarity: int = 200
+    near_dup_similarity_ocr: float = 0.80
+    min_chars_for_similarity: int = 80
     require_entity_match: bool = True
     require_date_compatible: bool = True
     block_by_type: bool = True
+    entity_fuzzy_threshold: float = 0.90
 
 
 SERVICING_TEAMS: List[str] = ["Risk Advisory", "Audit", "Tax", "Consulting",
