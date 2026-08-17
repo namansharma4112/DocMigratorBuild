@@ -364,14 +364,14 @@ def test_classify_document_picks_expected_bucket():
 def test_classify_document_falls_back_to_other_for_unrelated_text():
     cfg = ClassificationThresholds()
     result = classify_document("This is a completely unrelated memo about lunch plans.", cfg)
-    assert result.doc_type == "Other"
+    assert result.doc_type == "Unclassified"
     assert result.needs_review is True
 
 
 def test_classify_document_handles_empty_text():
     cfg = ClassificationThresholds()
     result = classify_document("", cfg)
-    assert result.doc_type == "Other"
+    assert result.doc_type == "Unclassified"
     assert result.needs_review is True
 
 
