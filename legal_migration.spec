@@ -39,7 +39,13 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    # UPDATED: register the multiprocessing runtime hook so the parallel
+    # extraction workers bootstrap correctly inside the frozen .exe WITHOUT
+    # any change to app_gui.py. The hook calls multiprocessing.freeze_support()
+    # before the main script in every process (parent and each spawned child),
+    # so worker processes run the worker bootstrap and exit instead of
+    # re-launching the GUI. See rthook_multiprocessing.py for the full rationale.
+    runtime_hooks=["rthook_multiprocessing.py"],
     excludes=["matplotlib", "notebook", "IPython", "PyQt5", "PySide2"],
     cipher=block_cipher,
 )
