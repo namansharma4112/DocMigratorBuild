@@ -1,11 +1,13 @@
 from __future__ import annotations
-import argparse, json, shutil, time, traceback
+import argparse, json, multiprocessing, os, shutil, time, traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Dict, List
 from tqdm import tqdm
-
 from .config import Config, DELETE_DOC_TYPES, FALLBACK_TYPE, folder_group_for
-from .extract import extract_document, normalise_text, sha256_text, ExtractedDoc
+from .extract import (extract_document, extract_worker, normalise_text,
+                      sha256_text, ExtractedDoc)
 from .classify import classify_document
 from .metadata import extract_metadata
 from .dedupe import DedupRecord, deduplicate
@@ -29,13 +31,82 @@ _EXTRACTED_DOC_FIELDS = {f.name for f in __import__("dataclasses").fields(Extrac
 _DEFAULT_FLUSH_EVERY = 200
 
 
+def _extract_one(p: Path, cfg) -> ExtractedDoc:
+    """Sequential, fully crash-isolated single-file extraction (also the
+    fallback path). A failure here is captured as a 'failed' ExtractedDoc so it
+    can never abort the run."""
+    return extract_worker(str(p), cfg.ingestion)
+
+
+def _cpu_count() -> int:
+    return os.cpu_count() or 1
+
+
+def _resolve_parallelism(cfg, n_items: int):
+    """Decide (workers, omp_threads_per_worker) with a hard safety bias.
+
+    Design rules (validated empirically):
+      * A configured ``max_workers`` always wins (``1`` == fully sequential,
+        byte-for-byte the original behaviour).
+      * AUTO mode only parallelises when there is genuine spare CPU headroom.
+        On <= 2 cores the OCR subprocess chain (poppler + OpenMP Tesseract)
+        already saturates every core, so extra worker processes only
+        oversubscribe and SLOW THINGS DOWN — measured repeatedly. There we
+        stay sequential and simply let Tesseract's own OpenMP use the cores.
+      * When we do parallelise, we pin each worker's Tesseract to
+        ``max(1, cores // workers)`` OpenMP threads so that
+        ``workers x threads ~= cores`` — filling otherwise-idle cores with
+        concurrent documents WITHOUT oversubscription.
+    Returns (workers, omp_threads). workers==1 means "run sequentially".
+    """
+    configured = getattr(cfg.ingestion, "max_workers", None)
+    cpu = _cpu_count()
+    if configured is not None:
+        try:
+            workers = int(configured)
+        except Exception:
+            workers = 1
+        workers = max(1, workers)
+    else:
+        # AUTO: only parallelise when there is spare headroom.
+        workers = cpu if cpu > 2 else 1
+    workers = max(1, min(workers, max(1, n_items)))
+    omp = max(1, cpu // workers) if workers > 1 else 0  # 0 -> leave default
+    return workers, omp
+
+
+def _extract_sequential(to_process, docs, cfg, record_cache, progress, done, total):
+    for i, p in to_process:
+        doc = _extract_one(p, cfg)
+        docs[i] = doc
+        record_cache(p, doc)
+        done += 1
+        if progress:
+            progress("extract", done, total, p.name)
+    return done
+
+
 def stage_extract(cfg, pdfs, progress=None, flush_every: int = _DEFAULT_FLUSH_EVERY):
+    """Extract text from every PDF.
+
+    * Cache hits (unchanged files) are served instantly on the main process —
+      preserving the resume/idempotency guarantees exactly.
+    * Only genuine cache MISSES are dispatched. In AUTO mode this uses a
+      core-aware PROCESS pool (see _resolve_parallelism) that fills idle cores
+      on multi-core machines and stays fully sequential when there is no spare
+      CPU, so it can never regress on small boxes.
+    * Results are re-assembled in the ORIGINAL input order, so classification
+      and (order-sensitive) dedup produce byte-for-byte identical output to the
+      sequential version — verified in tests.
+    * Reliability: each file is crash-isolated inside the worker; and if a
+      worker process dies abruptly (native crash) the pool's BrokenProcessPool
+      is caught and the remaining files finish on the safe sequential path.
+    """
     cache = _load_cache(cfg.paths.cache_path())
     cfg.paths.cache_path().parent.mkdir(parents=True, exist_ok=True)
-    docs = []
-    pending_lines: List[str] = []
     total = len(pdfs)
-    it = pdfs if progress else tqdm(pdfs, desc="Extracting text", unit="pdf")
+    docs: List[ExtractedDoc] = [None] * total  # type: ignore[list-item]
+    pending_lines: List[str] = []
 
     def _flush():
         nonlocal pending_lines
@@ -44,31 +115,7 @@ def stage_extract(cfg, pdfs, progress=None, flush_every: int = _DEFAULT_FLUSH_EV
                 f.write("\n".join(pending_lines) + "\n")
             pending_lines = []
 
-    for i, p in enumerate(it, start=1):
-        if progress: progress("extract", i, total, p.name)
-        try:
-            key = str(p.resolve())
-            stat = p.stat()
-            cached = cache.get(key)
-            if (cached is not None
-                    and cached.get("size_bytes") == stat.st_size
-                    and cached.get("mtime_ns") == stat.st_mtime_ns):
-                clean = {k: v for k, v in cached.items() if k in _EXTRACTED_DOC_FIELDS}
-                docs.append(ExtractedDoc(**clean)); continue
-            doc = extract_document(p, cfg.ingestion)
-        except Exception as e:
-            try:
-                size = p.stat().st_size
-            except Exception:
-                size = 0
-            doc = ExtractedDoc(
-                path=str(p), file_name=p.name, size_bytes=size, page_count=0,
-                text="", extraction_method="failed",
-                file_sha256=f"__unreadable__:{p}",
-                text_sha256=sha256_text(""), is_scanned=False,
-                error=f"could not process file: {e}\n{traceback.format_exc(limit=2)}",
-            )
-        docs.append(doc)
+    def _record_cache(p: Path, doc: ExtractedDoc):
         try:
             mtime_ns = p.stat().st_mtime_ns
         except Exception:
@@ -78,7 +125,69 @@ def stage_extract(cfg, pdfs, progress=None, flush_every: int = _DEFAULT_FLUSH_EV
         pending_lines.append(json.dumps(cache_line))
         if len(pending_lines) >= flush_every:
             _flush()
+
+    # 1) Resolve cache hits first (instant); queue the rest for the pool.
+    to_process: List[tuple] = []  # (index, path)
+    for i, p in enumerate(pdfs):
+        try:
+            stat = p.stat()
+            cached = cache.get(str(p.resolve()))
+        except Exception:
+            cached, stat = None, None
+        if (cached is not None and stat is not None
+                and cached.get("size_bytes") == stat.st_size
+                and cached.get("mtime_ns") == stat.st_mtime_ns):
+            clean = {k: v for k, v in cached.items() if k in _EXTRACTED_DOC_FIELDS}
+            docs[i] = ExtractedDoc(**clean)
+        else:
+            to_process.append((i, p))
+
+    done = total - len(to_process)  # cache hits already done
+    if progress:
+        progress("extract", max(done, 1), max(total, 1),
+                 f"{done} cached" if done else (pdfs[0].name if pdfs else ""))
+
+    if to_process:
+        workers, omp = _resolve_parallelism(cfg, len(to_process))
+        if workers <= 1:
+            done = _extract_sequential(to_process, docs, cfg, _record_cache,
+                                       progress, done, total)
+        else:
+            # Pin each worker's Tesseract OpenMP threads BEFORE spawning so the
+            # children inherit it (workers x omp ~= cores, no oversubscription).
+            if omp:
+                os.environ["OMP_THREAD_LIMIT"] = str(omp)
+            ctx = multiprocessing.get_context("spawn")  # safe on Win + *nix
+            ing = cfg.ingestion
+            try:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+                    future_map = {pool.submit(extract_worker, str(p), ing): (i, p)
+                                  for i, p in to_process}
+                    for fut in as_completed(future_map):
+                        i, p = future_map[fut]
+                        doc = fut.result()  # worker is crash-isolated
+                        docs[i] = doc
+                        _record_cache(p, doc)  # cache writes on main process only
+                        done += 1
+                        if progress:
+                            progress("extract", done, total, p.name)
+            except BrokenProcessPool:
+                # A worker died abruptly (rare native crash). Do NOT fail the
+                # run — finish whatever is left on the bullet-proof sequential
+                # path. Already-completed results and cache lines are retained.
+                # Pending files are derived from the empty slots in O(n) once
+                # (only on failure) — no per-file bookkeeping in the hot loop.
+                if progress:
+                    progress("extract", done, total, "(recovering — sequential)")
+                still = [(i, p) for i, p in to_process if docs[i] is None]
+                done = _extract_sequential(still, docs, cfg, _record_cache,
+                                           progress, done, total)
     _flush()
+
+    # Defensive: guarantee no None slots survive (e.g. empty input edge).
+    for i, p in enumerate(pdfs):
+        if docs[i] is None:
+            docs[i] = _extract_one(p, cfg)
     return docs
 
 
@@ -140,17 +249,14 @@ def _unique_dest(folder: Path, file_name: str, idx: int) -> Path:
 def stage_organise(cfg, rows, copy_removed=False, progress=None):
     class_root = cfg.paths.organised_dir()
     consolidated = cfg.paths.consolidated_dir()
-
     if class_root.exists():
         shutil.rmtree(class_root)
     if consolidated.exists():
         shutil.rmtree(consolidated)
     consolidated.mkdir(parents=True, exist_ok=True)
-
     total = len(rows)
     for i, r in enumerate(rows, start=1):
         if progress: progress("organise", i, total, r["file_name"])
-
         if r["status"] == "excluded":
             subfolder = class_root / "_DO_NOT_RETAIN" / r["doc_type"]
             subfolder.mkdir(parents=True, exist_ok=True)
@@ -161,12 +267,10 @@ def stage_organise(cfg, rows, copy_removed=False, progress=None):
                 r["target_folder"] = f"(copy failed: {e})"
             r["consolidated_path"] = "(not copied — DO NOT RETAIN)"
             continue
-
         if r["is_duplicate"] and not copy_removed:
             r["target_folder"] = "(not copied — duplicate)"
             r["consolidated_path"] = "(not copied — duplicate)"
             continue
-
         folder_name = folder_group_for(r["doc_type"])
         subfolder = class_root / folder_name
         if r["confidence"] == "LOW" or r["doc_type"] == FALLBACK_TYPE:
@@ -177,7 +281,6 @@ def stage_organise(cfg, rows, copy_removed=False, progress=None):
             shutil.copy2(r["path"], dest); r["target_folder"] = str(dest)
         except Exception as e:
             r["target_folder"] = f"(copy failed: {e})"
-
         cdest = _unique_dest(consolidated, r["file_name"], r["idx"])
         try:
             shutil.copy2(r["path"], cdest); r["consolidated_path"] = str(cdest)
@@ -198,7 +301,6 @@ def _configure_ocr_for_run(cfg, log):
             note += " [poppler_path not set - relying on PATH]"
         log(f"[OCR] {note}")
         return note
-
     status = ocr_support.configure_ocr()
     note = status.summary()
     log(f"[OCR] {note}")
@@ -219,14 +321,15 @@ def run(cfg, copy_files=True, log=print, progress=None):
         else:
             ocr_note = "disabled"
             log("[OCR] Disabled by user — scanned files flagged for review.")
-
         src = cfg.paths.source_dir
         if not src.exists(): raise SystemExit(f"Input folder does not exist: {src}")
         pdfs = sorted(set(sorted(src.rglob("*.pdf")) + sorted(src.rglob("*.PDF"))))
         if not pdfs: raise SystemExit(f"No PDF files found under {src.resolve()}")
         if progress: progress("scan", 1, 1, f"{len(pdfs)} PDFs found")
-
-        log(f"[1/6] Found {len(pdfs)} PDFs under {src}")
+        workers, omp = _resolve_parallelism(cfg, len(pdfs))
+        mode = (f"{workers} process workers x {omp or 'default'} OCR thread(s)"
+                if workers > 1 else f"sequential (cores={_cpu_count()})")
+        log(f"[1/6] Found {len(pdfs)} PDFs under {src} (extraction: {mode})")
         docs = stage_extract(cfg, pdfs, progress=progress)
         n_ocr = sum(1 for d in docs if d.extraction_method == "ocr")
         log(f"[2/6] Extracted text ({sum(1 for d in docs if d.is_scanned)} scanned; {n_ocr} read via OCR)")
@@ -239,7 +342,6 @@ def run(cfg, copy_files=True, log=print, progress=None):
         excluded = sum(1 for r in rows if r["status"] == "excluded")
         log(f"[4/6] Deduplicated: {retained} retained, {removed} removed as duplicates, "
             f"{excluded} excluded (DO NOT RETAIN)")
-
         if copy_files:
             stage_organise(cfg, rows, progress=progress)
             log(f"[5/6] Organised retained files -> {cfg.paths.organised_dir()}")
@@ -253,11 +355,9 @@ def run(cfg, copy_files=True, log=print, progress=None):
                 r["target_folder"] = "(copy skipped)"; r["consolidated_path"] = "(copy skipped)"
             if progress: progress("organise", 1, 1, "(copy skipped)")
             log("[5/6] File copy skipped")
-
         tracker = stage_tracker(cfg, rows, ocr_note, log=log)
         if progress: progress("tracker", 1, 1, str(tracker))
         log(f"[6/6] Tracker written -> {tracker}")
-
         n_failed = sum(1 for r in rows if r["extraction_method"] == "failed")
         summary = {
             "total": len(rows), "retained": retained, "removed": removed,
@@ -273,7 +373,6 @@ def run(cfg, copy_files=True, log=print, progress=None):
         for k, v in summary.items(): log(f"  {k:24}: {v}")
         if progress: progress("done", 1, 1, "")
         return summary
-
     except SystemExit:
         raise
     except Exception as e:
@@ -296,6 +395,8 @@ def _parse_args(argv=None):
     ap.add_argument("--source", type=Path); ap.add_argument("--output", type=Path)
     ap.add_argument("--similarity", type=float); ap.add_argument("--no-copy", action="store_true")
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="Extraction worker threads (default: auto from CPU count; 1 = sequential)")
     return ap.parse_args(argv)
 
 
@@ -305,6 +406,7 @@ def main(argv=None):
     if args.output: cfg.paths.output_dir = args.output
     if args.similarity is not None: cfg.dedup.near_dup_similarity = args.similarity
     if args.no_ocr: cfg.ingestion.enable_ocr = False
+    if args.workers is not None: cfg.ingestion.max_workers = args.workers
     run(cfg, copy_files=not args.no_copy)
 
 
