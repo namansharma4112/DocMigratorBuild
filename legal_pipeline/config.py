@@ -45,7 +45,7 @@ class Paths:
 class Ingestion:
     min_native_chars: int = 120
     ocr_max_pages: Optional[int] = None
-    ocr_dpi: int = 300
+    ocr_dpi: int = 220
     ocr_lang: str = "eng"
     enable_ocr: bool = True
     tesseract_cmd: Optional[str] = None
