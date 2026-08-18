@@ -50,6 +50,14 @@ class Ingestion:
     enable_ocr: bool = True
     tesseract_cmd: Optional[str] = None
     poppler_path: Optional[str] = None
+    # --- performance (added; internal only, not surfaced in the GUI) ---
+    # None -> auto-selected at runtime from CPU count. 1 == fully sequential
+    # (identical behaviour to the pre-parallel version).
+    max_workers: Optional[int] = None
+    # Per-page OCR safety timeout (seconds). Guards against a single
+    # pathological page hanging a worker forever. Generous so it never
+    # trips on normal pages.
+    ocr_page_timeout_sec: int = 240
 
 
 CLASSIFICATION_KEYWORDS: Dict[str, List[str]] = {
@@ -175,9 +183,9 @@ CANONICAL_HEADING_PHRASES: Dict[str, List[str]] = {
     "SOW": ["scope of work", "statement of work"],
     "Contracts": ["services agreement"],
 }
+
 FUZZY_HEADING_THRESHOLD: float = 0.82
 MIN_FUZZY_PHRASE_LENGTH: int = 7
-
 CATCH_ALL_CATEGORY: str = "Contracts"
 FALLBACK_TYPE: str = "Unclassified"
 
